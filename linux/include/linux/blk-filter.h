@@ -35,7 +35,6 @@ const char* blk_filter_who_is_there(size_t altitude);
 
 int blk_filter_attach_disks(blk_filter_t* filter);
 
-blk_qc_t blk_filter_submit_bio_altitude(size_t altitude, struct bio *bio);
 blk_qc_t blk_filter_submit_bio_next(blk_filter_t* filter, struct bio *bio);
 
 
