@@ -1,0 +1,162 @@
+diff --git a/block/Kconfig b/block/Kconfig
+index bbad5e8bbffe..d30e326c59df 100644
+--- a/block/Kconfig
++++ b/block/Kconfig
+@@ -204,6 +204,12 @@ config BLK_INLINE_ENCRYPTION_FALLBACK
+ 	  by falling back to the kernel crypto API when inline
+ 	  encryption hardware is not present.
+ 
++config BLK_FILTER
++	bool "Enable Block Layer Filters support"
++	help
++	  Enabling this lets 3rd side kernel modulers to intercept 
++	  requests for block devices.
++
+ menu "Partition Types"
+ 
+ source "block/partitions/Kconfig"
+diff --git a/block/Makefile b/block/Makefile
+index 8d841f5f986f..af1e93bf940c 100644
+--- a/block/Makefile
++++ b/block/Makefile
+@@ -38,3 +38,4 @@ obj-$(CONFIG_BLK_SED_OPAL)	+= sed-opal.o
+ obj-$(CONFIG_BLK_PM)		+= blk-pm.o
+ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= keyslot-manager.o blk-crypto.o
+ obj-$(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)	+= blk-crypto-fallback.o
++obj-$(CONFIG_BLK_FILTER)	+= blk-filter.o
+\ No newline at end of file
+diff --git a/block/blk-core.c b/block/blk-core.c
+index d9d632639bd1..7693aaf2c156 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -50,6 +50,9 @@
+ #include "blk-mq-sched.h"
+ #include "blk-pm.h"
+ #include "blk-rq-qos.h"
++#ifdef CONFIG_BLK_FILTER 
++#include "blk-filter-internal.h"
++#endif
+ 
+ struct dentry *blk_debugfs_root;
+ 
+@@ -1273,13 +1276,21 @@ blk_qc_t submit_bio(struct bio *bio)
+ 		blk_qc_t ret;
+ 
+ 		psi_memstall_enter(&pflags);
++#ifdef CONFIG_BLK_FILTER
++		ret = blk_filter_submit_bio(bio);
++#else
+ 		ret = submit_bio_noacct(bio);
++#endif //CONFIG_BLK_FILTER
+ 		psi_memstall_leave(&pflags);
+ 
+ 		return ret;
+ 	}
+ 
++#ifdef CONFIG_BLK_FILTER
++	return blk_filter_submit_bio(bio);
++#else		
+ 	return submit_bio_noacct(bio);
++#endif //CONFIG_BLK_FILTER
+ }
+ EXPORT_SYMBOL(submit_bio);
+ 
+diff --git a/block/genhd.c b/block/genhd.c
+index 99c64641c314..65ac5447ea14 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -25,6 +25,9 @@
+ #include <linux/badblocks.h>
+ 
+ #include "blk.h"
++#ifdef CONFIG_BLK_FILTER 
++#include "blk-filter-internal.h"
++#endif
+ 
+ static DEFINE_MUTEX(block_class_lock);
+ static struct kobject *block_depr;
+@@ -837,6 +840,9 @@ static void __device_add_disk(struct device *parent, struct gendisk *disk,
+ 	 */
+ 	WARN_ON_ONCE(!blk_get_queue(disk->queue));
+ 
++#ifdef CONFIG_BLK_FILTER
++	blk_filter_disk_add(disk);
++#endif //CONFIG_BLK_FILTER
+ 	disk_add_events(disk);
+ 	blk_integrity_add(disk);
+ }
+@@ -900,6 +906,9 @@ void del_gendisk(struct gendisk *disk)
+ 
+ 	might_sleep();
+ 
++#ifdef CONFIG_BLK_FILTER
++	blk_filter_disk_del(disk);
++#endif //CONFIG_BLK_FILTER
+ 	blk_integrity_del(disk);
+ 	disk_del_events(disk);
+ 
+@@ -1562,8 +1571,12 @@ static void disk_release(struct device *dev)
+ 
+ 	might_sleep();
+ 
++#ifdef CONFIG_BLK_FILTER
++	blk_filter_disk_release(disk);
++#endif //CONFIG_BLK_FILTER
+ 	blk_free_devt(dev->devt);
+ 	disk_release_events(disk);
++
+ 	kfree(disk->random);
+ 	disk_replace_part_tbl(disk, NULL);
+ 	hd_free_part(&disk->part0);
+@@ -2339,3 +2352,25 @@ static void disk_release_events(struct gendisk *disk)
+ 	WARN_ON_ONCE(disk->ev && disk->ev->block != 1);
+ 	kfree(disk->ev);
+ }
++
++
++int disk_enumerate(void (*fn)(struct gendisk* disk, void* ctx ), void* ctx)
++{
++	struct class_dev_iter *iter;
++	struct device *dev;
++
++	iter = kmalloc(sizeof(*iter), GFP_KERNEL);
++	if (!iter)
++		return -ENOMEM;
++
++	class_dev_iter_init(iter, &block_class, NULL, &disk_type);
++	dev = class_dev_iter_next(iter);
++	while(dev) {
++		fn(dev_to_disk(dev), ctx);
++		dev = class_dev_iter_next(iter);
++	};
++
++	kfree(iter);
++	return 0;
++}
++
+diff --git a/drivers/block/Makefile b/drivers/block/Makefile
+index e1f63117ee94..1d54c81a3a63 100644
+--- a/drivers/block/Makefile
++++ b/drivers/block/Makefile
+@@ -28,6 +28,7 @@ obj-$(CONFIG_BLK_DEV_UMEM)	+= umem.o
+ obj-$(CONFIG_BLK_DEV_NBD)	+= nbd.o
+ obj-$(CONFIG_BLK_DEV_CRYPTOLOOP) += cryptoloop.o
+ obj-$(CONFIG_VIRTIO_BLK)	+= virtio_blk.o
++obj-$(CONFIG_BLK_FILTER)	+= blk-flt-trace.o
+ 
+ obj-$(CONFIG_BLK_DEV_SX8)	+= sx8.o
+ 
+diff --git a/include/linux/genhd.h b/include/linux/genhd.h
+index 4ab853461dff..a26be290bcd3 100644
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -319,6 +319,9 @@ extern void set_capacity_revalidate_and_notify(struct gendisk *disk,
+ 			sector_t size, bool revalidate);
+ extern unsigned int disk_clear_events(struct gendisk *disk, unsigned int mask);
+ 
++extern int disk_enumerate(void (*fn)(struct gendisk* disk, void* cxt), void* cxt);
++
++
+ /* drivers/char/random.c */
+ extern void add_disk_randomness(struct gendisk *disk) __latent_entropy;
+ extern void rand_initialize_disk(struct gendisk *disk);
