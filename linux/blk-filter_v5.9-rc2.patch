@@ -1,0 +1,532 @@
+diff --git a/Makefile b/Makefile
+index c4470a4e131f..f21168154160 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@
+ VERSION = 5
+ PATCHLEVEL = 9
+ SUBLEVEL = 0
+-EXTRAVERSION = -rc1
++EXTRAVERSION = -rc2
+ NAME = Kleptomaniac Octopus
+ 
+ # *DOCUMENTATION*
+diff --git a/block/Kconfig b/block/Kconfig
+index bbad5e8bbffe..a308801b4376 100644
+--- a/block/Kconfig
++++ b/block/Kconfig
+@@ -204,6 +204,17 @@ config BLK_INLINE_ENCRYPTION_FALLBACK
+ 	  by falling back to the kernel crypto API when inline
+ 	  encryption hardware is not present.
+ 
++config BLK_FILTER
++	bool "Enable support for block layer filters"
++	default y
++	depends on MODULES
++	help
++	  Enabling this lets third-party kernel modules intercept
++	  bio requests for any block device. This allows them to implement
++	  changed block tracking and snapshots without any reconfiguration of
++	  the existing setup. For example, this option allows snapshotting of
++	  a block device without adding it to LVM.
++
+ menu "Partition Types"
+ 
+ source "block/partitions/Kconfig"
+diff --git a/block/Makefile b/block/Makefile
+index 8d841f5f986f..b8ee50b8e031 100644
+--- a/block/Makefile
++++ b/block/Makefile
+@@ -38,3 +38,4 @@ obj-$(CONFIG_BLK_SED_OPAL)	+= sed-opal.o
+ obj-$(CONFIG_BLK_PM)		+= blk-pm.o
+ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= keyslot-manager.o blk-crypto.o
+ obj-$(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)	+= blk-crypto-fallback.o
++obj-$(CONFIG_BLK_FILTER)	+= blk-filter.o
+diff --git a/block/blk-core.c b/block/blk-core.c
+index d9d632639bd1..3421ddeb69e5 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -50,6 +50,7 @@
+ #include "blk-mq-sched.h"
+ #include "blk-pm.h"
+ #include "blk-rq-qos.h"
++#include "blk-filter-internal.h"
+ 
+ struct dentry *blk_debugfs_root;
+ 
+@@ -1273,13 +1274,19 @@ blk_qc_t submit_bio(struct bio *bio)
+ 		blk_qc_t ret;
+ 
+ 		psi_memstall_enter(&pflags);
+-		ret = submit_bio_noacct(bio);
++		if (IS_ENABLED(CONFIG_BLK_FILTER))
++			ret = blk_filter_submit_bio(bio);
++		else
++			ret = submit_bio_noacct(bio);
+ 		psi_memstall_leave(&pflags);
+ 
+ 		return ret;
+ 	}
+ 
+-	return submit_bio_noacct(bio);
++	if (IS_ENABLED(CONFIG_BLK_FILTER))
++		return blk_filter_submit_bio(bio);
++	else
++		return submit_bio_noacct(bio);
+ }
+ EXPORT_SYMBOL(submit_bio);
+ 
+diff --git a/block/blk-filter-internal.h b/block/blk-filter-internal.h
+new file mode 100644
+index 000000000000..942066f3fecb
+--- /dev/null
++++ b/block/blk-filter-internal.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ *
++ * Block device filters internal declarations
++ */
++
++#ifndef BLK_FILTER_INTERNAL_H
++#define BLK_FILTER_INTERNAL_H
++
++#ifdef CONFIG_BLK_FILTER
++#include <linux/blk-filter.h>
++
++void blk_filter_disk_add(struct gendisk *disk);
++
++void blk_filter_disk_del(struct gendisk *disk);
++
++void blk_filter_disk_release(struct gendisk *disk);
++
++blk_qc_t blk_filter_submit_bio(struct bio *bio);
++
++#else /* CONFIG_BLK_FILTER */
++
++static inline void blk_filter_disk_add(struct gendisk *disk) { }
++
++static inline void blk_filter_disk_del(struct gendisk *disk) { }
++
++static inline void blk_filter_disk_release(struct gendisk *disk) { }
++
++static inline blk_qc_t blk_filter_submit_bio(struct bio *bio) { return 0; }
++
++#endif /* CONFIG_BLK_FILTER */
++
++#endif
+diff --git a/block/blk-filter.c b/block/blk-filter.c
+new file mode 100644
+index 000000000000..edb30f342a3d
+--- /dev/null
++++ b/block/blk-filter.c
+@@ -0,0 +1,288 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/genhd.h>
++#include <linux/bio.h>
++#include <linux/blkdev.h>
++#include "blk-filter-internal.h"
++#include <linux/rwsem.h>
++
++struct blk_filter_ctx {
++	struct blk_filter *filter;
++	/*
++	 * Reserved for extension
++	 */
++};
++
++DECLARE_RWSEM(blk_filter_ctx_list_lock);
++struct blk_filter_ctx *blk_filter_ctx_list[BLK_FILTER_ALTITUDE_MAX] = { 0 };
++
++static inline struct blk_filter_ctx *_get_ctx(size_t altitude)
++{
++	return blk_filter_ctx_list[altitude-1];
++}
++
++static inline void _set_ctx(size_t altitude, struct blk_filter_ctx *ctx)
++{
++	blk_filter_ctx_list[altitude-1] = ctx;
++}
++
++static struct blk_filter_ctx *_blk_ctx_new(struct blk_filter *filter)
++{
++	struct blk_filter_ctx *ctx = kzalloc(sizeof(struct blk_filter_ctx), GFP_KERNEL);
++
++	if (!ctx)
++		return ctx;
++
++	ctx->filter = filter;
++
++	return ctx;
++}
++
++static int _blk_ctx_link(struct blk_filter_ctx *ctx, size_t altitude)
++{
++	int result = 0;
++
++	if (altitude > BLK_FILTER_ALTITUDE_MAX)
++		return -ENOENT;
++
++	down_write(&blk_filter_ctx_list_lock);
++
++	if (_get_ctx(altitude))
++		result = -EEXIST;
++	else
++		_set_ctx(altitude, ctx);
++
++	up_write(&blk_filter_ctx_list_lock);
++
++	return result;
++}
++
++static int _blk_ctx_unlink(struct blk_filter_ctx *ctx)
++{
++	int result = -EEXIST;
++	size_t altitude = BLK_FILTER_ALTITUDE_MIN;
++
++	down_write(&blk_filter_ctx_list_lock);
++
++	for (; altitude <= BLK_FILTER_ALTITUDE_MAX; ++altitude) {
++		if (_get_ctx(altitude) && (_get_ctx(altitude) == ctx)) {
++			_set_ctx(altitude, NULL);
++			result = 0;
++			break;
++		}
++	}
++
++	up_write(&blk_filter_ctx_list_lock);
++
++	return result;
++}
++
++/**
++ * blk_filter_disk_add() - Notify filters when a new disk is added.
++ * @disk: The new disk.
++ */
++void blk_filter_disk_add(struct gendisk *disk)
++{
++	size_t altitude = BLK_FILTER_ALTITUDE_MIN;
++
++	pr_warn("blk-filter: add disk [%s].\n", disk->disk_name);
++
++	down_read(&blk_filter_ctx_list_lock);
++
++	for (; altitude <= BLK_FILTER_ALTITUDE_MAX; ++altitude) {
++		struct blk_filter_ctx *ctx = _get_ctx(altitude);
++
++		if (ctx && ctx->filter->ops && ctx->filter->ops->disk_add)
++			ctx->filter->ops->disk_add(disk);
++	}
++
++	up_read(&blk_filter_ctx_list_lock);
++}
++
++/**
++ * blk_filter_disk_del() - Notify filters when the disk is deleted.
++ * @disk: The disk to delete.
++ */
++void blk_filter_disk_del(struct gendisk *disk)
++{
++	size_t altitude = BLK_FILTER_ALTITUDE_MIN;
++
++	pr_warn("blk-filter: del disk [%s].\n", disk->disk_name);
++
++	down_read(&blk_filter_ctx_list_lock);
++
++	for (; altitude <= BLK_FILTER_ALTITUDE_MAX; ++altitude) {
++		struct blk_filter_ctx *ctx = _get_ctx(altitude);
++
++		if (ctx && ctx->filter->ops && ctx->filter->ops->disk_del)
++			ctx->filter->ops->disk_del(disk);
++	}
++
++	up_read(&blk_filter_ctx_list_lock);
++}
++
++/**
++ * blk_filter_disk_release() - Notify filters when the disk is released.
++ * @disk: The disk to release.
++ */
++void blk_filter_disk_release(struct gendisk *disk)
++{
++	size_t altitude = BLK_FILTER_ALTITUDE_MAX;
++
++	pr_warn("blk-filter: release disk [%s].\n", disk->disk_name);
++
++	down_read(&blk_filter_ctx_list_lock);
++
++	for (; altitude <= BLK_FILTER_ALTITUDE_MIN; --altitude) {
++		struct blk_filter_ctx *ctx = _get_ctx(altitude);
++
++		if (ctx && ctx->filter->ops && ctx->filter->ops->disk_release)
++			ctx->filter->ops->disk_release(disk);
++	}
++
++	up_read(&blk_filter_ctx_list_lock);
++}
++
++/**
++ * blk_filter_submit_bio_altitude() - Send bio for porcessing to specific filter.
++ * @altitude: The filter altitude.
++ * @bio: The new bio for block I/O layer.
++ *
++ * Return: Bio submitting result, like for submit_bio function.
++ */
++blk_qc_t blk_filter_submit_bio_altitude(size_t altitude, struct bio *bio)
++{
++	blk_qc_t ret;
++	bool bypass = true;
++
++	down_read(&blk_filter_ctx_list_lock);
++	while (altitude >= BLK_FILTER_ALTITUDE_MIN) {
++		struct blk_filter_ctx *ctx = _get_ctx(altitude);
++
++		if (ctx && ctx->filter->ops && ctx->filter->ops->submit_bio) {
++			ret = ctx->filter->ops->submit_bio(bio);
++			bypass = false;
++			break;
++		}
++		--altitude;
++	}
++	up_read(&blk_filter_ctx_list_lock);
++
++	if (bypass)
++		ret = submit_bio_noacct(bio);
++
++	return ret;
++}
++
++/**
++ * blk_filter_submit_bio() - Send new bio to filters for processing.
++ * @bio: The new bio for block I/O layer.
++ *
++ * Return: Bio submitting result, like for submit_bio function.
++ */
++blk_qc_t blk_filter_submit_bio(struct bio *bio)
++{
++	return blk_filter_submit_bio_altitude(BLK_FILTER_ALTITUDE_MAX, bio);
++}
++
++/**
++ * blk_filter_register() - Create new block I/O layer filter.
++ * @filter: The filter description structure.
++ *
++ * Return: Zero if the filter was registered successfully or an error code if it failed.
++ */
++int blk_filter_register(struct blk_filter *filter)
++{
++	int result = 0;
++	struct blk_filter_ctx *ctx;
++
++	pr_warn("blk-filter: register filter [%s].\n", filter->name);
++
++	ctx = _blk_ctx_new(filter);
++	if (!ctx)
++		return -ENOMEM;
++
++	result = _blk_ctx_link(ctx, filter->altitude);
++	if (result)
++		goto failed;
++
++	filter->blk_filter_ctx = (void *)ctx;
++	return 0;
++
++failed:
++	kfree(ctx);
++	return result;
++}
++EXPORT_SYMBOL(blk_filter_register);
++
++/**
++ * blk_filter_unregister() - Remove existing block I/O layer filter.
++ * @filter: The filter description structure.
++ *
++ * Return: Zero if the filter was removed successfully or an error code if it failed.
++ */
++int blk_filter_unregister(struct blk_filter *filter)
++{
++	int result = 0;
++	struct blk_filter_ctx *ctx;
++
++	pr_warn("blk-filter: unregister filter [%s].\n", filter->name);
++
++	ctx = (struct blk_filter_ctx *)filter->blk_filter_ctx;
++
++	result = _blk_ctx_unlink(ctx);
++	if (result == 0)
++		kfree(ctx);
++
++	return result;
++}
++EXPORT_SYMBOL(blk_filter_unregister);
++
++/**
++ * blk_filter_check_altitude() - Checking that altitude is free.
++ * @altitude: The filter description structure.
++ *
++ * Return: NULL if the altitude is free or the name of the module registered at this altitude.
++ */
++const char *blk_filter_check_altitude(size_t altitude)
++{
++	struct blk_filter_ctx *ctx = _get_ctx(altitude);
++
++	if (!ctx)
++		return NULL;
++
++	return ctx->filter->name;
++}
++EXPORT_SYMBOL(blk_filter_check_altitude);
++
++static void _attach_fn(struct gendisk *disk, void *_ctx)
++{
++	struct blk_filter *filter = (struct blk_filter *)_ctx;
++
++	if (filter->ops && filter->ops->disk_add)
++		filter->ops->disk_add(disk);
++}
++
++/**
++ * blk_filter_attach_disks() - Enumerate all existing disks and call disk_add callback for each.
++ * @filter: The filter description structure.
++ *
++ * Return: Zero if the existing disks was attached successfully or an error code if it failed.
++ */
++int blk_filter_attach_disks(struct blk_filter *filter)
++{
++	return disk_enumerate(_attach_fn, filter);
++}
++EXPORT_SYMBOL(blk_filter_attach_disks);
++
++/**
++ * blk_filter_submit_bio_next() - Send a bio to the lower filters for processing.
++ * @bio: The bio for block I/O layer.
++ *
++ * Return: Bio submitting result, like for submit_bio function.
++ */
++blk_qc_t blk_filter_submit_bio_next(struct blk_filter *filter, struct bio *bio)
++{
++	return blk_filter_submit_bio_altitude(filter->altitude-1, bio);
++}
++EXPORT_SYMBOL(blk_filter_submit_bio_next);
+diff --git a/block/genhd.c b/block/genhd.c
+index 99c64641c314..c5604415e772 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -25,6 +25,7 @@
+ #include <linux/badblocks.h>
+ 
+ #include "blk.h"
++#include "blk-filter-internal.h"
+ 
+ static DEFINE_MUTEX(block_class_lock);
+ static struct kobject *block_depr;
+@@ -837,6 +838,7 @@ static void __device_add_disk(struct device *parent, struct gendisk *disk,
+ 	 */
+ 	WARN_ON_ONCE(!blk_get_queue(disk->queue));
+ 
++	blk_filter_disk_add(disk);
+ 	disk_add_events(disk);
+ 	blk_integrity_add(disk);
+ }
+@@ -900,6 +902,7 @@ void del_gendisk(struct gendisk *disk)
+ 
+ 	might_sleep();
+ 
++	blk_filter_disk_del(disk);
+ 	blk_integrity_del(disk);
+ 	disk_del_events(disk);
+ 
+@@ -1562,6 +1565,7 @@ static void disk_release(struct device *dev)
+ 
+ 	might_sleep();
+ 
++	blk_filter_disk_release(disk);
+ 	blk_free_devt(dev->devt);
+ 	disk_release_events(disk);
+ 	kfree(disk->random);
+@@ -2339,3 +2343,23 @@ static void disk_release_events(struct gendisk *disk)
+ 	WARN_ON_ONCE(disk->ev && disk->ev->block != 1);
+ 	kfree(disk->ev);
+ }
++
++int disk_enumerate(void (*fn)(struct gendisk *disk, void *ctx), void *ctx)
++{
++	struct class_dev_iter *iter;
++	struct device *dev;
++
++	iter = kmalloc(sizeof(*iter), GFP_KERNEL);
++	if (!iter)
++		return -ENOMEM;
++
++	class_dev_iter_init(iter, &block_class, NULL, &disk_type);
++	dev = class_dev_iter_next(iter);
++	while (dev) {
++		fn(dev_to_disk(dev), ctx);
++		dev = class_dev_iter_next(iter);
++	};
++
++	kfree(iter);
++	return 0;
++}
+diff --git a/include/linux/blk-filter.h b/include/linux/blk-filter.h
+new file mode 100644
+index 000000000000..201613168864
+--- /dev/null
++++ b/include/linux/blk-filter.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * API declarations for kernel modules utilizing block device filters
++ */
++
++#ifndef BLK_FILTER_H
++#define BLK_FILTER_H
++
++#ifdef CONFIG_BLK_FILTER
++#define BLK_FILTER_ALTITUDE_MAX 4
++#define BLK_FILTER_ALTITUDE_MIN 1
++
++struct blk_filter_ops {
++	void (*disk_add)(struct gendisk *disk);
++	void (*disk_del)(struct gendisk *disk);
++	void (*disk_release)(struct gendisk *disk);
++	blk_qc_t (*submit_bio)(struct bio *bio);
++};
++
++struct blk_filter {
++	const char *name;
++	const struct blk_filter_ops *ops;
++	size_t altitude;
++	void *blk_filter_ctx;
++};
++
++
++int blk_filter_register(struct blk_filter *filter);
++
++int blk_filter_unregister(struct blk_filter *filter);
++
++const char *blk_filter_check_altitude(size_t altitude);
++
++int blk_filter_attach_disks(struct blk_filter *filter);
++
++blk_qc_t blk_filter_submit_bio_next(struct blk_filter *filter, struct bio *bio);
++
++#endif /* CONFIG_BLK_FILTER */
++
++#endif
+diff --git a/include/linux/genhd.h b/include/linux/genhd.h
+index 4ab853461dff..5f065f8989b4 100644
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -319,6 +319,8 @@ extern void set_capacity_revalidate_and_notify(struct gendisk *disk,
+ 			sector_t size, bool revalidate);
+ extern unsigned int disk_clear_events(struct gendisk *disk, unsigned int mask);
+ 
++extern int disk_enumerate(void (*fn)(struct gendisk *disk, void *cxt), void *cxt);
++
+ /* drivers/char/random.c */
+ extern void add_disk_randomness(struct gendisk *disk) __latent_entropy;
+ extern void rand_initialize_disk(struct gendisk *disk);
