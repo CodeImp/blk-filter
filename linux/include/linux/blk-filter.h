@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+
 /*
  * API declarations for kernel modules utilizing block device filters
-*/
+ */
 
 #ifndef BLK_FILTER_H
 #define BLK_FILTER_H
@@ -18,22 +19,22 @@ struct blk_filter_ops {
 };
 
 struct blk_filter {
-	const char* name;
+	const char *name;
 	const struct blk_filter_ops *ops;
 	size_t altitude;
-	void* blk_filter_ctx;
+	void *blk_filter_ctx;
 };
 
 
-int blk_filter_register(struct blk_filter* filter);
+int blk_filter_register(struct blk_filter *filter);
 
-int blk_filter_unregister(struct blk_filter* filter);
+int blk_filter_unregister(struct blk_filter *filter);
 
-const char* blk_filter_check_altitude(size_t altitude);
+const char *blk_filter_check_altitude(size_t altitude);
 
-int blk_filter_attach_disks(struct blk_filter* filter);
+int blk_filter_attach_disks(struct blk_filter *filter);
 
-blk_qc_t blk_filter_submit_bio_next(struct blk_filter* filter, struct bio *bio);
+blk_qc_t blk_filter_submit_bio_next(struct blk_filter *filter, struct bio *bio);
 
 #endif /* CONFIG_BLK_FILTER */
 
